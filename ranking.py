@@ -3,6 +3,7 @@ import datetime as dt
 import math
 import re
 import unicodedata
+from quality import adult_scope, baseball_context, conference_key, any_word
 
 GAME, ADULT, BALL = 'ゲーム業界', '成人向け同人ゲーム', '野球'
 UTC = dt.timezone.utc
@@ -28,6 +29,8 @@ def features(article, config):
     settings = config['ranking']
     flags = {name: has(title, words) for name,words in settings['signals'].items()}
     if article['category'] == GAME:
+        quality=config['quality']
+        flags['business'] = any_word(article['title'],quality['business_actions']) or (any_word(article['title'],quality['business_subject']) and any_word(article['title'],quality['business_change']))
         # A figure's "new release" is not a new video game announcement.
         flags['announcement']=bool(re.search(r'(?:新作|続編|リメイク|新タイトル).{0,35}(?:発表|公開|発売日.{0,6}決定)',title)) or has(title,('新作発表','発売日決定'))
         negated_release=bool(re.search(r'新作(?:発表)?(?:は|の予定は)?(?:なし|無し|ない|見送り)',title))
@@ -36,16 +39,14 @@ def features(article, config):
                       and (not (flags['anniversary'] or flags['promotion']) or flags['announcement']))
         flags['substantive'] = flags['business'] or flags['update'] or release_news
     elif article['category'] == ADULT:
-        if flags['promotion'] and not has(title,('規約','審査','停止','障害','終了','規制','変更','問題','取り扱い','禁止','不具合','再開','撤回')):
-            flags['policy']=False
-        if flags['promotion'] and not has(title,('ヒットの背景','売上動向','市場','ヒット事例','ランキング動向','ランキング分析','売上分析','独自取材')):
-            flags['sales_case']=False
-        if flags['promotion'] and not has(title,('制作手法','技術解説','導入事例','商用利用','取り扱い','販売条件')):
-            flags['ai_production']=False
-        flags['substantive'] = flags['policy'] or flags['market_change'] or flags['sales_case'] or flags['ai_production']
+        scope=adult_scope(article,config)
+        flags.update(policy=scope['policy'],market_change=scope['market'],sales_case=scope['sales'],ai_production=scope['production_ai'],substantive=scope['useful'])
     else:
         if flags['dena'] or (flags['roster'] and has(title,('NPB','プロ野球','ドラフト'))):
             flags['high_school']=False
+        flags['retrospective']=baseball_context(article,config)['retrospective']
+        if flags['retrospective']:
+            flags['roster']=False;flags['major']=False;flags['international_major']=False
         flags['regional'] = flags['high_school'] and flags['regional_event']
         flags['national_major'] = flags['high_school'] and (bool(re.search(r'(?:全国|甲子園).{0,16}(?:大会.{0,3})?(?:中止|開催断念)',title)) or flags['major'] or (flags['national_event'] and not flags['regional'] and ('決勝' in title.replace('準々決勝','').replace('準決勝','') or has(title,('全国制覇','大会中止','全試合中止')))))
     return flags
@@ -72,6 +73,10 @@ def assess(article, config):
         elif f['sales_case']: importance=points['sales']; reasons.append('売上・ヒット事例')
         elif f['ai_production']: importance=points['ai']; reasons.append('制作・販売に役立つAI情報')
         else: importance=points['general']; reasons.append('一般的な作品情報')
+        if adult_scope(article,config)['scope']=='precedent':
+            importance=min(importance,config['quality']['precedent_importance']);reasons.append('個別措置の先行事例として評価')
+        if adult_scope(article,config)['sales_announcement']:
+            importance=min(importance,config['quality']['sales_announcement_importance']);reasons.append('販売実績付き告知であり分析とは区別')
         if f['promotion'] and not f['substantive']:
             importance=points['promotion']; reasons.append('単発宣伝・キャンペーンを減点')
         interest=0; tier='adult'
@@ -87,8 +92,20 @@ def assess(article, config):
             importance=min(importance,points['roundup']);reasons.append('一覧・回顧情報を減点')
         if f['former_player'] and f['outside_baseball']:
             importance=points['outside'];interest=0;reasons.append('元選手の競技外の話題を減点')
+    if article['category']==GAME and f['substantive'] and has(article['title'],config['quality']['major_release']):
+        importance+=config['quality']['major_release_bonus'];reasons.append('主要な新作発表を評価')
+    if article['category']==BALL and f['retrospective']:
+        importance=min(importance,config['quality']['retrospective_importance']);interest=config['quality']['retrospective_interest'];reasons.append('現在の動きではない人物紹介・回顧')
+    if article['category']==GAME:
+        info_type='business' if f['business'] else 'update' if f['update'] else 'indie' if f['indie'] else 'release' if f['substantive'] else 'reference'
+        details={'info_type':info_type}
+    elif article['category']==ADULT:
+        scope=adult_scope(article,config)
+        details={'info_type':scope['classification'],'scope':scope['scope'],'classification_evidence':scope['evidence']}
+    else:
+        details={'info_type':'retrospective' if f['retrospective'] else 'current','temporal_context':baseball_context(article,config)}
     notable = importance >= settings['notable_min']
-    return {'importance':importance,'importance_reasons':reasons,'interest':interest,
+    return {**details,'importance':importance,'importance_reasons':reasons,'interest':interest,
             'coverage_group':tier,'regional_high_school':f.get('regional',False) and not f.get('national_major',False) and not f.get('major',False),
             'priority':'注目' if notable else '通常'}
 
@@ -118,6 +135,7 @@ def _kind(article,config):
         subject='payment' if has(t,('決済','クレジットカード','クレカ','カード決済')) else 'ai' if has(t,('AI作品','AI生成','生成AI')) else 'review' if has(t,('審査',)) else 'terms'
         action='resume' if has(t,('再開','撤回')) else 'stop' if has(t,('停止','終了','禁止','利用不能')) else 'change'
         return subject+':'+action
+    if conference_key(article,config):return 'conference'
     return 'game' if not f['roster'] and not f['major'] else ''
 
 
@@ -156,6 +174,7 @@ def story_signature(article,config):
         brand='dlsite' if has(title,('DLsite',)) else 'fanza' if has(title,('FANZA',)) else ''
         if not brand:return None
         return (kind,brand)
+    if kind=='conference':return conference_key(article,config)
     opponents=teams(title,config)
     if len(opponents)!=2:return None
     stage=next((s for s in ('準々決勝','準決勝','決勝','1回戦','2回戦','第1試合','第2試合') if s in title),'')
@@ -173,6 +192,8 @@ def same_story(a,b,config):
     if a['category']!=b['category']:return False
     # Independent reporting and material updates survive event-level grouping.
     followups=config['ranking']['keep_followups']
+    if a['category']==BALL:
+        followups=[word for word in followups if word!='インタビュー']+['追加発表','新たな契約','新たな移籍','重要な分析']
     if has(a['title'],followups) or has(b['title'],followups):return False
     for terms in config['ranking'].get('material_terms',[]):
         left_terms={word for word in terms if has(a['title'],[word])}
@@ -212,7 +233,7 @@ def rank_articles(articles,rules,now):
             a.update(info,ranking_score=round(value,3),ranking_reasons=age)
             pool.append(a)
         selected=[]
-        topic_counts={};regional_count=0
+        topic_counts={};type_counts={};regional_count=0
         while pool:
             eligible=pool
             if topic==BALL and len(selected)<5 and regional_count>=config['ranking']['regional_top5_limit']:
@@ -221,7 +242,12 @@ def rank_articles(articles,rules,now):
             def adjusted(a):
                 group=competition(a['title']) if a['regional_high_school'] else story_signature(a,config)
                 penalty=topic_counts.get(group,0)*config['ranking']['same_topic_penalty'] if group else 0
-                return (a['ranking_score']-penalty,date(a['published']),a['url'])
+                type_penalty=0
+                if topic==GAME:
+                    q=config['quality'];count=type_counts.get(a['info_type'],0)
+                    alternatives=[b for b in pool if b['info_type']!=a['info_type'] and b['importance']>=q['diversity_min_importance'] and b['ranking_score']>=a['ranking_score']-q['diversity_score_gap']]
+                    if alternatives:type_penalty=min(q['diversity_max_penalty'],max(0,count-1)*q['diversity_penalty'])
+                return (a['ranking_score']-penalty-type_penalty,date(a['published']),a['url'])
             winner=max(eligible,key=adjusted)
             group=competition(winner['title']) if winner['regional_high_school'] else story_signature(winner,config)
             effective=adjusted(winner)[0]
@@ -229,6 +255,7 @@ def rank_articles(articles,rules,now):
             winner['ranking_score']=round(effective,3)
             winner['display_order']=len(selected)
             selected.append(winner);pool.remove(winner)
+            type_counts[winner['info_type']]=type_counts.get(winner['info_type'],0)+1
             if group:topic_counts[group]=topic_counts.get(group,0)+1
             regional_count+=bool(winner['regional_high_school'])
         result.extend(selected)

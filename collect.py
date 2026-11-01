@@ -3,6 +3,7 @@
 import datetime as dt
 import email.utils
 import json
+import html
 import re
 import unicodedata
 import urllib.parse
@@ -10,6 +11,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from pathlib import Path
+from quality import adult_scope
 from ranking import assess, features, rank_value, rank_articles, related_to, attach_related
 
 ROOT = Path(__file__).resolve().parent
@@ -49,7 +51,7 @@ REASONS = {
     'invalid': 'タイトル・URL・公開日時が不正', 'future': '未来の公開日時',
     'old': '公開日時が収集対象期間外', 'unrelated': 'カテゴリとの関連性不足',
     'non_game_market': '同人ゲーム市場との関連性不足', 'low_score': '関連性・重要度スコア不足',
-    'duplicate': '同一・類似記事', 'same_story': '同一の出来事（代表記事へ関連リンクを集約）',
+    'individual_update':'個別作品の販売停止・販売告知', 'work_promotion':'作品紹介・おすすめ・単なる宣伝', 'duplicate': '同一・類似記事', 'same_story': '同一の出来事（代表記事へ関連リンクを集約）',
 }
 
 
@@ -103,7 +105,7 @@ def score_article(article, topic):
     if topic == '成人向け同人ゲーム':
         # Platform names alone do not make a product advert useful to a creator.
         names = {r['name'] for r in matches}
-        if names == {'市場・ヒット'} and not contains(title, ('ゲーム', '同人', '制作', 'クリエイター')):
+        if names == {'市場・ヒット'} and not contains(title, ('ゲーム', '同人', '制作', 'クリエイター')) and not adult_scope(article,config)['useful']:
             return 0, [], 'non_game_market'
     score = sum(r['weight'] for r in matches)
     if re.search(r'[＜<]?画像\s*\d+\s*/', title):
@@ -112,6 +114,13 @@ def score_article(article, topic):
     reasons = [{'rule': r['name'], 'points': r['weight']} for r in matches]
     signals=features(article,config)
     # Anniversary/goods words must not discard an actual new game announcement.
+    if topic == '成人向け同人ゲーム':
+        classification=adult_scope(article,config)
+        if classification['classification'] in ('individual_update','work_promotion'):
+            return score,reasons,classification['classification']
+        if classification['useful'] and score < config['threshold']:
+            reasons.append({'rule':'影響範囲・分析・制作情報の評価','points':config['threshold']-score})
+            score=config['threshold']
     if topic == 'ゲーム業界' and signals['substantive'] and score < config['threshold']:
         reasons.append({'rule':'実質的なゲームニュースの保護','points':config['threshold']-score})
         score=config['threshold']
@@ -153,7 +162,8 @@ def read_rss(xml_bytes, topic, now):
         source_node = node.find('source')
         article = {'category': topic, 'title': clean_title(node.findtext('title') or '', source),
                    'url': (node.findtext('link') or '').strip(), 'source': source,
-                   'source_url': source_node.get('url', '') if source_node is not None else ''}
+                   'source_url': source_node.get('url', '') if source_node is not None else '',
+                   'summary': html.unescape(re.sub(r'<[^>]+>',' ',node.findtext('description') or ''))[:1000]}
         try:
             published = email.utils.parsedate_to_datetime(node.findtext('pubDate') or '')
             if published.tzinfo is None:
@@ -210,7 +220,7 @@ def duplicate(article, existing):
 
 
 def default_fetch(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'MyNewsFeed/0.3.1 (personal RSS reader)'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'MyNewsFeed/0.3.2 (personal RSS reader)'})
     with urllib.request.urlopen(req, timeout=15) as response:
         return response.read()
 
@@ -221,7 +231,7 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
     previous = previous or {}
     previous_diagnostics = previous_diagnostics or previous.get('diagnostics', {})
     errors, output, candidates = [], [], []
-    diagnostics = {'version': '0.3.1', 'attempted_at': now.isoformat(), 'categories': {}, 'reason_labels': REASONS, 'scoring': RULES}
+    diagnostics = {'version': '0.3.2', 'attempted_at': now.isoformat(), 'categories': {}, 'reason_labels': REASONS, 'scoring': RULES}
     for topic, queries in TOPICS.items():
         old = previous_diagnostics.get('categories', {}).get(topic, {})
         diag = {'fetched': 0, 'accepted': 0, 'excluded': 0, 'retained': 0,
@@ -246,6 +256,8 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
                 decision = {'title': article['title'], 'url': article['url'],
                             'score': article.get('score'), 'score_reasons': article.get('score_reasons', []),
                             'reason': reason, 'query': query}
+                decision.update({key:article.get(key) for key in ('category','published','source','source_url','summary')})
+                decision['classification']=assess(article,RULES[topic])
                 if article.get('official_confirmation'):
                     decision.update(official_confirmation=article['official_confirmation'], source_url=article['source_url'])
                 diag['decisions'].append(decision)
@@ -295,7 +307,7 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
             attach_related(representative,article)
             continue
         score, reasons, rejected = score_article(article, topic)
-        important_adult = topic == '成人向け同人ゲーム' and score >= RULES[topic]['important']
+        important_adult = topic == '成人向け同人ゲーム' and score >= RULES[topic]['important'] and features(article,RULES[topic])['substantive']
         days = RULES[topic].get('retain_days', RULES[topic]['days']) if important_adult else RULES[topic]['days']
         age = now - timestamp(article['published'])
         failed = diag['status'] in ('partial', 'failed')
@@ -319,7 +331,8 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
         ranked=[a for a in output if a['category']==topic]
         diag['top5']=[{'title':a['title'],'importance':a['importance'],'ranking_score':a['ranking_score'],
                        'priority':a['priority'],'interest':a['interest'],'reasons':a['importance_reasons'],
-                       'ranking_reasons':a['ranking_reasons']} for a in ranked[:5]]
+                       'ranking_reasons':a['ranking_reasons'],'info_type':a['info_type'],
+                       'scope':a.get('scope'),'context':a.get('temporal_context')} for a in ranked[:5]]
     baseball = [a for a in output if a['category'] == '野球']
     diagnostics['baseball_coverage'] = {
         'dena': sum(contains(a['title'], ('DeNA', 'ベイスターズ')) for a in baseball),
@@ -358,6 +371,8 @@ def run(root=ROOT, fetch=None, now=None):
         for topic, diag in result['diagnostics']['categories'].items():
             diag['retained'] = sum(a.get('category') == topic for a in previous.get('articles', []))
             diag['displayed'] = diag['retained']
+            diag['top5']=[{key:a[key] for key in ('title','published','priority','importance','ranking_score') if key in a} for a in previous.get('articles',[]) if a.get('category')==topic][:5]
+            diag['top5_source']='preserved_previous_feed'
     write_json(root / 'diagnostics.json', result['diagnostics'])
     if not result['diagnostics']['all_failed']:
         write_json(output, result)
