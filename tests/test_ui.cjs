@@ -72,3 +72,15 @@ async function fetchScenario(news,diagnostics,options={}){
   assert.equal(result.elements.status.textContent,'取得エラー');
   console.log('Fetch/UI checks passed: fresh diagnostics, failed/partial states, legacy fallback, stale log ignored, fetch error.');
 })().catch(error=>{console.error(error);process.exitCode=1;});
+
+// v0.3.1: display_order is authoritative in both all and individual views.
+run("data=cats.slice(1).flatMap(category=>Array.from({length:7},(_,i)=>({category,title:category+i,url:'https://example.org/'+i,source:'Test',published:new Date(Date.UTC(2026,10,i+1)).toISOString(),display_order:i,priority:i===0?'注目':'通常'})));selectCategory('すべて')");
+for(let i=0;i<3;i++){
+  const allTitles=descendants(nodes.items.children[i],'a').map(n=>n.textContent);
+  assert.equal(allTitles[0],['ゲーム業界','成人向け同人ゲーム','野球'][i]+'0');
+  run(`selectCategory('${['ゲーム業界','成人向け同人ゲーム','野球'][i]}')`);
+  assert.deepEqual(descendants(nodes.items,'a').slice(0,5).map(n=>n.textContent),allTitles);
+  assert.equal(descendants(nodes.items,'div').filter(n=>n.className==='priority').length,1);
+  run("selectCategory('すべて')");
+}
+console.log('Ranking/UI checks passed: display_order overrides dates, identical top five across tabs, badges obey collector.');
