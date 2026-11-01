@@ -10,6 +10,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from pathlib import Path
+from ranking import assess, features, rank_value, rank_articles, related_to, attach_related
 
 ROOT = Path(__file__).resolve().parent
 UTC = dt.timezone.utc
@@ -48,7 +49,7 @@ REASONS = {
     'invalid': 'タイトル・URL・公開日時が不正', 'future': '未来の公開日時',
     'old': '公開日時が収集対象期間外', 'unrelated': 'カテゴリとの関連性不足',
     'non_game_market': '同人ゲーム市場との関連性不足', 'low_score': '関連性・重要度スコア不足',
-    'duplicate': '同一・類似記事',
+    'duplicate': '同一・類似記事', 'same_story': '同一の出来事（代表記事へ関連リンクを集約）',
 }
 
 
@@ -109,8 +110,16 @@ def score_article(article, topic):
         score -= 8
         matches.append({'name': '画像ページ', 'weight': -8})
     reasons = [{'rule': r['name'], 'points': r['weight']} for r in matches]
-    # A nuisance word must not veto major business/policy/baseball news.
-    if any(r['name'] in config.get('protected_rules', []) for r in matches):
+    signals=features(article,config)
+    # Anniversary/goods words must not discard an actual new game announcement.
+    if topic == 'ゲーム業界' and signals['substantive'] and score < config['threshold']:
+        reasons.append({'rule':'実質的なゲームニュースの保護','points':config['threshold']-score})
+        score=config['threshold']
+    protected=any(r['name'] in config.get('protected_rules', []) for r in matches)
+    if topic == '成人向け同人ゲーム' and not signals['policy']:
+        protected=False
+    # Protection affects acceptance, not the independent importance assessment.
+    if protected:
         floor = config['important']
         if score < floor:
             reasons.append({'rule': '重要事項の保護', 'points': floor-score})
@@ -157,7 +166,7 @@ def read_rss(xml_bytes, topic, now):
         age = now - published
         score, reasons, rejected = score_article(article, topic)
         article.update(score=score, score_reasons=reasons,
-                       priority='注目' if score >= RULES[topic]['important'] else '通常')
+                       priority=assess(article,RULES[topic])['priority'])
         if not article['title'] or not valid_url(article['url']):
             rejected = 'invalid'
         elif age.total_seconds() < -3600:
@@ -201,7 +210,7 @@ def duplicate(article, existing):
 
 
 def default_fetch(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'MyNewsFeed/0.3 (personal RSS reader)'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'MyNewsFeed/0.3.1 (personal RSS reader)'})
     with urllib.request.urlopen(req, timeout=15) as response:
         return response.read()
 
@@ -212,7 +221,7 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
     previous = previous or {}
     previous_diagnostics = previous_diagnostics or previous.get('diagnostics', {})
     errors, output, candidates = [], [], []
-    diagnostics = {'version': '0.3', 'attempted_at': now.isoformat(), 'categories': {}, 'reason_labels': REASONS, 'scoring': RULES}
+    diagnostics = {'version': '0.3.1', 'attempted_at': now.isoformat(), 'categories': {}, 'reason_labels': REASONS, 'scoring': RULES}
     for topic, queries in TOPICS.items():
         old = previous_diagnostics.get('categories', {}).get(topic, {})
         diag = {'fetched': 0, 'accepted': 0, 'excluded': 0, 'retained': 0,
@@ -248,8 +257,8 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
         diag['status'] = 'failed' if success == 0 else 'partial' if success < len(queries) else 'ok'
         if diag['status'] == 'ok':
             diag['last_complete_success_at'] = now.isoformat()
-    # Newest report wins; the score breaks equal publication-time ties.
-    for article, diag, q, decision in sorted(candidates, key=lambda c: (c[0]['published'], c[0]['score']), reverse=True):
+    # Choose the strongest representative before grouping the same event.
+    for article, diag, q, decision in sorted(candidates, key=lambda c: (rank_value(c[0],RULES[c[0]['category']],now)[0],c[0]['published']), reverse=True):
         old = next((a for a in previous.get('articles', [])
                     if a.get('category') == article['category'] and a.get('title') and a.get('url')
                     and timestamp(a.get('published')) and duplicate(article, [a])), None)
@@ -262,6 +271,10 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
                 continue
         if duplicate(article, output):
             reject(diag, q, decision, 'duplicate')
+        elif (representative := related_to(article,output,RULES[article['category']])) is not None:
+            attach_related(representative,article)
+            decision['grouped_into']=representative['url']
+            reject(diag,q,decision,'same_story')
         else:
             article.setdefault('first_seen_at', now.isoformat())
             output.append(article)
@@ -277,6 +290,10 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
         if fresh:
             fresh['first_seen_at'] = article.get('first_seen_at', article['published'])
             continue
+        representative=related_to(article,output,RULES[topic])
+        if representative is not None:
+            attach_related(representative,article)
+            continue
         score, reasons, rejected = score_article(article, topic)
         important_adult = topic == '成人向け同人ゲーム' and score >= RULES[topic]['important']
         days = RULES[topic].get('retain_days', RULES[topic]['days']) if important_adult else RULES[topic]['days']
@@ -285,7 +302,7 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
         if (failed or important_adult) and not rejected and dt.timedelta(hours=-1) <= age <= dt.timedelta(days=days):
             saved = dict(article, title=clean_title(article['title'], article.get('source', '')),
                          score=score, score_reasons=reasons,
-                         priority='注目' if score >= RULES[topic]['important'] else '通常',
+                         priority=assess(article,RULES[topic])['priority'],
                          retained=True, retained_reason='fetch_failure' if failed else 'important_adult',
                          first_seen_at=article.get('first_seen_at', article['published']))
             if not duplicate(saved, output):
@@ -297,7 +314,12 @@ def collect(fetch=None, now=None, previous=None, previous_diagnostics=None):
                                 'partial_fetch_failure' if diag['status'] == 'partial' else
                                 'has_articles' if diag['accepted'] else
                                 'A_no_results' if diag['fetched'] == 0 else 'C_all_filtered')
-    output.sort(key=lambda a: (timestamp(a['published']), a.get('score', 0)), reverse=True)
+    output=rank_articles(output,RULES,now)
+    for topic,diag in diagnostics['categories'].items():
+        ranked=[a for a in output if a['category']==topic]
+        diag['top5']=[{'title':a['title'],'importance':a['importance'],'ranking_score':a['ranking_score'],
+                       'priority':a['priority'],'interest':a['interest'],'reasons':a['importance_reasons'],
+                       'ranking_reasons':a['ranking_reasons']} for a in ranked[:5]]
     baseball = [a for a in output if a['category'] == '野球']
     diagnostics['baseball_coverage'] = {
         'dena': sum(contains(a['title'], ('DeNA', 'ベイスターズ')) for a in baseball),

@@ -41,7 +41,7 @@ function articleCard(a){
   return card;
 }
 function categorySection(category,preview){
-  const items=data.filter(a=>a.category===category).sort((a,b)=>new Date(b.published)-new Date(a.published));
+  const items=data.filter(a=>a.category===category).sort((a,b)=>Number.isFinite(a.display_order)&&Number.isFinite(b.display_order)?a.display_order-b.display_order:new Date(b.published)-new Date(a.published));
   const section=document.createElement('section');section.className='news-section';
   const heading=document.createElement('div');heading.className='section-heading';
   const title=document.createElement('h2');title.textContent=category;title.tabIndex=-1;
